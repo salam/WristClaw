@@ -1,6 +1,6 @@
 # WristClaw
 
-**Apple Watch voice interface for AI agents.**
+**Apple Watch voice / text / image interface for AI agents such as OpenClaw.**
 
 WristClaw lets you talk to your AI agent from your wrist. Hold the mic button, speak — the agent answers in audio, text, and images. Designed for [OpenClaw](https://openclaw.ai) but protocol-open: any backend that speaks the relay wire format works.
 
