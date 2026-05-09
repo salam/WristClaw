@@ -1,0 +1,46 @@
+{
+  "name": "@wristclaw/openclaw-channel",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for WristClaw Apple Watch relay",
+  "type": "module",
+  "private": true,
+  "peerDependencies": {
+    "openclaw": ">=2026.5.7"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "setupEntry": "./setup-entry.js",
+    "channel": {
+      "id": "wristclaw",
+      "label": "WristClaw",
+      "selectionLabel": "WristClaw",
+      "detailLabel": "Apple Watch relay",
+      "docsPath": "/channels/wristclaw",
+      "docsLabel": "wristclaw",
+      "blurb": "Talk to OpenClaw from Apple Watch with encrypted text, audio, images, and extensions.",
+      "systemImage": "applewatch",
+      "cliAddOptions": [
+        {
+          "flags": "--url <url>",
+          "description": "WristClaw relay WebSocket URL"
+        },
+        {
+          "flags": "--token <session-id>",
+          "description": "WristClaw pairing session UUID"
+        }
+      ]
+    },
+    "install": {
+      "defaultChoice": "local",
+      "localPath": "~/WristClaw/openclaw-plugin"
+    },
+    "compat": {
+      "pluginApi": ">=2026.5.7"
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,19 @@
+services:
+  mcp:
+    build: .
+    container_name: wristclaw-mcp
+    ports:
+      # Apache reverse-proxies /mcp on objex; bind to loopback in production.
+      - "${BIND_ADDR:-0.0.0.0}:${HOST_PORT:-8000}:8000"
+    environment:
+      RELAY_HEALTH_URL: "${RELAY_HEALTH_URL:-http://wristclaw-relay:8080/health}"
+      FASTMCP_HOST: "0.0.0.0"
+      FASTMCP_PORT: "8000"
+    networks:
+      - default
+      - relay_default
+    restart: unless-stopped
+
+networks:
+  relay_default:
+    external: true

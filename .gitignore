@@ -1,0 +1,22 @@
+# Environment / secrets
+.env
+.env.local
+**/.env
+
+# Go build artifacts
+relay/relay
+relay/*.test
+relay/*.out
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+plugin/node_modules/
+mcp/node_modules/
+
+# macOS
+.DS_Store

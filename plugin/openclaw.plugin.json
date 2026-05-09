@@ -1,0 +1,93 @@
+{
+  "id": "wristclaw",
+  "kind": "channel",
+  "name": "WristClaw",
+  "description": "Apple Watch relay channel for OpenClaw.",
+  "activation": {
+    "onStartup": true,
+    "onChannels": [
+      "wristclaw"
+    ],
+    "onCapabilities": [
+      "channel"
+    ]
+  },
+  "channels": [
+    "wristclaw"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "wristclaw": {
+      "label": "WristClaw",
+      "description": "Apple Watch relay channel for text, audio, image thumbnails, and extension responses.",
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "relayUrl": {
+            "type": "string"
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "defaultTo": {
+            "type": "string"
+          },
+          "extensionsPath": {
+            "type": "string"
+          },
+          "mediaDir": {
+            "type": "string"
+          },
+          "terse": {
+            "type": "boolean"
+          },
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "relayUrl": {
+                  "type": "string"
+                },
+                "sessionId": {
+                  "type": "string"
+                },
+                "defaultTo": {
+                  "type": "string"
+                },
+                "extensionsPath": {
+                  "type": "string"
+                },
+                "mediaDir": {
+                  "type": "string"
+                },
+                "terse": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

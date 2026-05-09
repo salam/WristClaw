@@ -1,0 +1,27 @@
+{
+  "plugins": [
+    {
+      "name": "@wristclaw/openclaw-channel",
+      "version": "0.1.0",
+      "openclaw": {
+        "plugin": {
+          "id": "wristclaw"
+        },
+        "channel": {
+          "id": "wristclaw",
+          "label": "WristClaw",
+          "selectionLabel": "WristClaw",
+          "detailLabel": "Apple Watch relay",
+          "docsPath": "/channels/wristclaw",
+          "docsLabel": "wristclaw",
+          "blurb": "Talk to OpenClaw from Apple Watch with encrypted text, audio, images, and extensions.",
+          "systemImage": "applewatch"
+        },
+        "install": {
+          "defaultChoice": "local",
+          "localPath": "~/WristClaw/openclaw-plugin"
+        }
+      }
+    }
+  ]
+}
