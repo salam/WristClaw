@@ -131,13 +131,13 @@ npm test
 Install into OpenClaw:
 
 ```sh
-curl -fsSL https://wristclaw.app/install.sh | bash
+openclaw plugins install @wristclaw/openclaw-channel
 ```
 
-Or manually:
+Or from the install script:
 
 ```sh
-openclaw plugins install ./plugin
+curl -fsSL https://wristclaw.app/install.sh | bash
 ```
 
 ---

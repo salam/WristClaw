@@ -1,4 +1,4 @@
-name: Release relay
+name: Release
 
 on:
   push:
@@ -8,10 +8,11 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write
 
 jobs:
   build:
-    name: Build binaries
+    name: Build relay binaries
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -92,3 +93,50 @@ jobs:
             ```sh
             RELAY_TAG=${{ github.ref_name }} docker compose up -d
             ```
+
+  publish-skill:
+    name: Publish skill to ClawhHub
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install ClawhHub CLI
+        run: npm install -g clawhub
+      - name: Publish skill
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          clawhub skill publish . \
+            --slug wristclaw \
+            --version ${{ github.ref_name }} \
+            --changelog "Release ${{ github.ref_name }}" \
+            --json
+
+  publish-plugin:
+    name: Publish plugin to ClawhHub + npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Install ClawhHub CLI
+        run: npm install -g clawhub
+      - name: Publish to ClawhHub
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          clawhub package publish ./plugin \
+            --version ${{ github.ref_name }} \
+            --json
+      - name: Publish to npm
+        working-directory: plugin
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Stamp the version from the tag (strips leading 'v')
+          npm version ${GITHUB_REF_NAME#v} --no-git-tag-version
+          npm publish --access public

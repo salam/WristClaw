@@ -3,7 +3,13 @@
   "version": "0.1.0",
   "description": "OpenClaw channel plugin for WristClaw Apple Watch relay",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "homepage": "https://wristclaw.app",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/salam/wristclaw.git",
+    "directory": "plugin"
+  },
   "peerDependencies": {
     "openclaw": ">=2026.5.7"
   },
@@ -31,10 +37,6 @@
           "description": "WristClaw pairing session UUID"
         }
       ]
-    },
-    "install": {
-      "defaultChoice": "local",
-      "localPath": "~/WristClaw/openclaw-plugin"
     },
     "compat": {
       "pluginApi": ">=2026.5.7"
