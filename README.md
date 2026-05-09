@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://wristclaw.app">wristclaw.app</a> &nbsp;·&nbsp;
-  <a href="https://openclaw.ai">OpenClaw</a> &nbsp;·&nbsp;
+  <a href="https://wristclaw.app/#download">Download App</a> &nbsp;·&nbsp;
   MIT License
 </p>
 
