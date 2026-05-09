@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app-icon.svg" width="96" alt="WristClaw logo"/>
+  <img src="logo.png" width="120" alt="WristClaw"/>
 </p>
 
 <h1 align="center">WristClaw</h1>
@@ -61,11 +61,18 @@ Environment variables (see `.env.example`):
 | `PORT`   | `8080`  | Listen port |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` |
 
-Docker:
+Docker (uses the pre-built image from ghcr.io):
 
 ```sh
 cd relay
 docker compose up -d
+```
+
+Or pull directly:
+
+```sh
+docker pull ghcr.io/salam/wristclaw-relay:latest
+docker run -p 8080:8080 ghcr.io/salam/wristclaw-relay:latest
 ```
 
 ### Wire protocol
