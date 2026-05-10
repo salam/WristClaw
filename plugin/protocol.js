@@ -14,7 +14,8 @@ export const MSG = Object.freeze({
   EXT_REMOVE: 0x0b,
   EXT_RESPONSE: 0x0c,
   EXT_INVOKE: 0x0d,
-  CONTEXT: 0x0e
+  CONTEXT: 0x0e,
+  CONFIG: 0x0f
 });
 
 export const HEADER_SIZE = 37;

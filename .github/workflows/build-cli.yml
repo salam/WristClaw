@@ -1,0 +1,67 @@
+name: Build CLI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cli/**'
+      - '.github/workflows/build-cli.yml'
+  pull_request:
+    paths:
+      - 'cli/**'
+
+jobs:
+  validate:
+    name: Validate wristclaw-debug
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Syntax check
+        run: python3 -m py_compile cli/wristclaw-debug
+
+      - name: Import check (stdlib only)
+        run: |
+          python3 - <<'EOF'
+          import ast, sys
+          with open("cli/wristclaw-debug") as f:
+              tree = ast.parse(f.read())
+          imports = [
+              n.names[0].name if isinstance(n, ast.Import) else n.module
+              for n in ast.walk(tree)
+              if isinstance(n, (ast.Import, ast.ImportFrom))
+          ]
+          stdlib = {"json","os","re","sys","urllib","urllib.request","urllib.error",
+                    "datetime","pathlib","argparse"}
+          third_party = [i for i in imports if i and i.split(".")[0] not in stdlib]
+          if third_party:
+              print(f"Unexpected third-party imports: {third_party}", file=sys.stderr)
+              sys.exit(1)
+          print("OK — stdlib only:", sorted(set(imports)))
+          EOF
+
+      - name: Smoke test (help)
+        run: python3 cli/wristclaw-debug --help
+
+  attach-to-release:
+    name: Attach CLI to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make executable
+        run: chmod +x cli/wristclaw-debug
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cli/wristclaw-debug

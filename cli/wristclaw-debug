@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""
+wristclaw-debug — inspect WristClaw channel state on the OpenClaw host.
+
+Usage:
+  wristclaw-debug             # full status dump
+  wristclaw-debug status      # relay + config summary
+  wristclaw-debug logs [-n N] # tail gateway log, wristclaw lines only
+  wristclaw-debug sessions    # active relay sessions (from log)
+  wristclaw-debug config      # wristclaw config from openclaw.json
+"""
+
+import json
+import os
+import re
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime
+from pathlib import Path
+
+# ── paths ─────────────────────────────────────────────────────────────────────
+HOME          = Path.home()
+OPENCLAW_JSON = HOME / ".openclaw" / "openclaw.json"
+GATEWAY_LOG   = HOME / ".openclaw" / "logs" / "gateway.log"
+GATEWAY_ERR   = HOME / ".openclaw" / "logs" / "gateway.err.log"
+
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+def c(text, code): return f"\033[{code}m{text}\033[0m"
+def green(t):  return c(t, "32")
+def red(t):    return c(t, "31")
+def yellow(t): return c(t, "33")
+def bold(t):   return c(t, "1")
+def dim(t):    return c(t, "2")
+def cyan(t):   return c(t, "36")
+def ok(t):     return f"  {green('✓')} {t}"
+def err(t):    return f"  {red('✗')} {t}"
+def warn(t):   return f"  {yellow('!')} {t}"
+def info(t):   return f"  {dim('·')} {t}"
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def load_openclaw_config():
+    try:
+        return json.loads(OPENCLAW_JSON.read_text())
+    except Exception as e:
+        return None
+
+
+def wristclaw_section(cfg):
+    if not cfg:
+        return {}
+    return cfg.get("channels", {}).get("wristclaw", {})
+
+
+def relay_url_from_cfg(wc):
+    accts = wc.get("accounts", {})
+    for acct in accts.values():
+        url = acct.get("relayUrl") or acct.get("url") or ""
+        if url:
+            return url
+    return wc.get("relayUrl") or wc.get("url") or "wss://relay.wristclaw.app/ws"
+
+
+def health_check(relay_wss_url):
+    """GET the relay /health endpoint. Returns (ok:bool, status_or_error:str)."""
+    url = relay_wss_url.replace("wss://", "https://").replace("ws://", "http://")
+    url = re.sub(r"/ws$", "", url.rstrip("/"))
+    health_url = f"{url}/health"
+    try:
+        req = urllib.request.urlopen(health_url, timeout=4)
+        return True, f"HTTP {req.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def tail_log(path, n=200):
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+        return lines[-n:]
+    except Exception:
+        return []
+
+
+def filter_wristclaw(lines):
+    return [l for l in lines if re.search(r"wristclaw|WristClaw|wc\b", l, re.IGNORECASE)]
+
+
+def parse_sessions_from_log(lines):
+    """Extract session-related lines: connect, disconnect, model used."""
+    sessions = []
+    for line in lines:
+        if re.search(r"wristclaw", line, re.IGNORECASE):
+            sessions.append(line)
+    return sessions[-30:]  # last 30
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_config():
+    cfg = load_openclaw_config()
+    if not cfg:
+        print(err("Cannot read ~/.openclaw/openclaw.json"))
+        return
+    wc = wristclaw_section(cfg)
+    if not wc:
+        print(warn("No wristclaw section in openclaw.json"))
+        return
+    print(bold("WristClaw config"))
+    print()
+    enabled = wc.get("enabled", False)
+    print(ok(f"enabled: {enabled}") if enabled else err(f"enabled: {enabled}"))
+    relay = relay_url_from_cfg(wc)
+    print(info(f"relayUrl: {cyan(relay)}"))
+    accts = wc.get("accounts", {})
+    for acct_id, acct in accts.items():
+        sid = acct.get("sessionId", "—")
+        name = acct.get("name", "—")
+        model = acct.get("model", "(default)")
+        print()
+        print(f"  {bold('account:')} {acct_id}")
+        print(info(f"name:      {name}"))
+        print(info(f"sessionId: {cyan(sid)}"))
+        print(info(f"model:     {model}"))
+
+
+def cmd_status():
+    print(bold("WristClaw status"))
+    print()
+
+    cfg = load_openclaw_config()
+    if cfg is None:
+        print(err("Cannot read ~/.openclaw/openclaw.json"))
+        return
+
+    wc = wristclaw_section(cfg)
+    enabled = wc.get("enabled", False)
+    print(ok("Plugin enabled") if enabled else err("Plugin not enabled"))
+
+    relay = relay_url_from_cfg(wc)
+    print(info(f"Relay: {relay}"))
+
+    relay_ok, relay_msg = health_check(relay)
+    print(ok(f"Relay health: {relay_msg}") if relay_ok else err(f"Relay unreachable: {relay_msg}"))
+
+    # Recent log activity
+    if GATEWAY_LOG.exists():
+        all_lines = tail_log(GATEWAY_LOG, 500)
+        wc_lines  = filter_wristclaw(all_lines)
+        if wc_lines:
+            last = wc_lines[-1]
+            ts_match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", last)
+            ts = ts_match.group(1) if ts_match else "?"
+            print(ok(f"Last log activity: {ts}"))
+            # Check for error markers in recent wristclaw lines
+            errors = [l for l in wc_lines[-20:] if re.search(r"error|fail|stuck|timeout", l, re.IGNORECASE)]
+            if errors:
+                print(warn(f"Recent errors ({len(errors)}):"))
+                for e_line in errors[-3:]:
+                    print(f"    {dim(e_line[:120])}")
+        else:
+            print(warn("No recent WristClaw activity in gateway.log"))
+    else:
+        print(warn("gateway.log not found"))
+
+    # Model in use
+    models_section = cfg.get("agents", {}).get("defaults", {}).get("model", {})
+    primary = models_section.get("primary", "(unknown)")
+    print(info(f"Default model: {primary}"))
+
+
+def cmd_logs(n=80):
+    print(bold(f"WristClaw log entries (last {n} matches)"))
+    print()
+    if not GATEWAY_LOG.exists():
+        print(err("gateway.log not found"))
+        return
+    all_lines = tail_log(GATEWAY_LOG, 2000)
+    wc_lines  = filter_wristclaw(all_lines)
+    if not wc_lines:
+        print(warn("No WristClaw lines found in gateway.log"))
+        return
+    for line in wc_lines[-n:]:
+        # Colour timestamps
+        coloured = re.sub(r"(\d{4}-\d{2}-\d{2}T[\d:+.]+)", lambda m: dim(m.group(1)), line)
+        # Colour errors
+        coloured = re.sub(r"\b(error|fail|fail\w*|stuck|timeout)\b", lambda m: red(m.group(0)), coloured, flags=re.I)
+        # Colour connected/ok
+        coloured = re.sub(r"\b(connected|ok|success)\b", lambda m: green(m.group(0)), coloured, flags=re.I)
+        print(coloured)
+
+    # Also show recent error log lines
+    if GATEWAY_ERR.exists():
+        err_lines = [l for l in tail_log(GATEWAY_ERR, 200) if re.search(r"wristclaw", l, re.IGNORECASE)]
+        if err_lines:
+            print()
+            print(bold("stderr (wristclaw):"))
+            for line in err_lines[-20:]:
+                print(f"  {red(line[:140])}")
+
+
+def cmd_sessions():
+    print(bold("WristClaw session activity"))
+    print()
+    if not GATEWAY_LOG.exists():
+        print(err("gateway.log not found"))
+        return
+    all_lines = tail_log(GATEWAY_LOG, 3000)
+    wc_lines  = filter_wristclaw(all_lines)
+    # Look for connect/disconnect events and model usage
+    connect    = [l for l in wc_lines if re.search(r"connect|handshake|join|healthState", l, re.IGNORECASE)]
+    model_uses = [l for l in wc_lines if re.search(r"model=|claude", l, re.IGNORECASE)]
+    dispatch   = [l for l in wc_lines if re.search(r"dispatch|turn|inbound|send", l, re.IGNORECASE)]
+
+    if connect:
+        print(bold("Connect events (last 5):"))
+        for line in connect[-5:]:
+            print(f"  {dim(line[:140])}")
+        print()
+    if model_uses:
+        print(bold("Model usage (last 5):"))
+        for line in model_uses[-5:]:
+            print(f"  {dim(line[:140])}")
+        print()
+    if dispatch:
+        print(bold("Dispatch events (last 5):"))
+        for line in dispatch[-5:]:
+            print(f"  {dim(line[:140])}")
+        print()
+    if not connect and not model_uses and not dispatch:
+        print(warn("No session events found"))
+
+
+def cmd_full():
+    cmd_status()
+    print()
+    cmd_config()
+    print()
+    print(bold("Recent log (last 20 WristClaw lines):"))
+    print()
+    all_lines = tail_log(GATEWAY_LOG, 1000)
+    wc_lines  = filter_wristclaw(all_lines)
+    for line in wc_lines[-20:]:
+        print(f"  {dim(line[:140])}")
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    cmd = args[0]
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "logs":
+        n = 80
+        if len(args) > 1 and args[1] == "-n" and len(args) > 2:
+            try: n = int(args[2])
+            except ValueError: pass
+        cmd_logs(n)
+    elif cmd == "sessions":
+        cmd_sessions()
+    elif cmd == "config":
+        cmd_config()
+    else:
+        print(err(f"Unknown command: {cmd}"))
+        print(__doc__.strip())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        cmd_full()
+    else:
+        main()

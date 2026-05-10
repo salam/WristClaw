@@ -170,6 +170,7 @@ export const wristclawPlugin = createChatChannelPlugin({
     deliveryMode: "direct",
     chunker: chunkText,
     chunkerMode: "text",
+    extractMarkdownImages: true,
     textChunkLimit: 1200,
     sendText: async ({ cfg, to, text, accountId }) => ({
       channel: CHANNEL,

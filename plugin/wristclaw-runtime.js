@@ -184,6 +184,15 @@ export function buildWristClawPrompt({ userText, ambientContext, lang, terse = t
   return lines.join("\n");
 }
 
+function withModelOverride(cfg, model) {
+  const clone = structuredClone(cfg);
+  clone.agents ??= {};
+  clone.agents.defaults ??= {};
+  clone.agents.defaults.model ??= {};
+  clone.agents.defaults.model.primary = model;
+  return clone;
+}
+
 function sessionRoute({ cfg, account, agentId }) {
   return buildChannelOutboundSessionRoute({
     cfg,
@@ -262,6 +271,7 @@ export class WristClawRelayClient {
     this.ws = null;
     this.abortController = new AbortController();
     this.latestContext = null;
+    this.preferredModel = "";
     this.pushedExtensionIds = new Set();
     this.connected = false;
   }
@@ -385,6 +395,7 @@ export class WristClawRelayClient {
       this.connected = true;
       this.setStatus({ running: true, connected: true, healthState: "connected", lastConnectedAt: Date.now(), lastEventAt: Date.now() });
       await this.pushExtensions();
+      this.pushConfig();
       return;
     }
     if (pkt.type === MSG.HEARTBEAT) {
@@ -399,6 +410,8 @@ export class WristClawRelayClient {
     this.setStatus({ running: true, connected: this.connected, lastInboundAt: Date.now(), lastEventAt: Date.now() });
     if (type === MSG.CONTEXT) {
       this.latestContext = JSON.parse(plaintext.toString("utf8"));
+      const model = this.latestContext?.preferredModel;
+      if (typeof model === "string") this.preferredModel = model;
       return;
     }
     if (type === MSG.TEXT_INPUT) {
@@ -427,6 +440,17 @@ export class WristClawRelayClient {
     this.pushedExtensionIds = currentIds;
   }
 
+  pushConfig() {
+    const models = Object.keys(this.cfg.agents?.defaults?.models ?? {});
+    if (!models.length) return;
+    const payload = Buffer.from(JSON.stringify({ models }), "utf8");
+    try {
+      this.sendEncrypted(MSG.CONFIG, payload);
+    } catch (err) {
+      log.warn(`pushConfig failed: ${String(err)}`);
+    }
+  }
+
   async dispatchAudio(audio) {
     await fsp.mkdir(this.account.mediaDir, { recursive: true });
     const filePath = path.join(this.account.mediaDir, `audio-${Date.now()}.m4a`);
@@ -440,8 +464,9 @@ export class WristClawRelayClient {
 
   async dispatchText(text, options = {}) {
     const agentId = "main";
-    const route = sessionRoute({ cfg: this.cfg, account: this.account, agentId });
-    const storePath = resolveStorePath(this.cfg.session?.store, { agentId });
+    const cfg = this.preferredModel ? withModelOverride(this.cfg, this.preferredModel) : this.cfg;
+    const route = sessionRoute({ cfg, account: this.account, agentId });
+    const storePath = resolveStorePath(cfg.session?.store, { agentId });
     const body = buildWristClawPrompt({
       userText: text,
       ambientContext: this.latestContext,
@@ -471,7 +496,7 @@ export class WristClawRelayClient {
       ...options.inboundAudio ? { InboundAudio: true } : {}
     });
     const replyPipeline = createChannelReplyPipeline({
-      cfg: this.cfg,
+      cfg,
       agentId,
       channel: CHANNEL,
       accountId: this.account.accountId
@@ -490,7 +515,7 @@ export class WristClawRelayClient {
           raw: { text, ...options }
         }),
         resolveTurn: () => ({
-          cfg: this.cfg,
+          cfg,
           channel: CHANNEL,
           accountId: this.account.accountId,
           agentId,
@@ -548,11 +573,18 @@ export class WristClawRelayClient {
         this.sendEncrypted(msgType, media.bytes);
       }
     }
-    // When the channel pipeline doesn't synthesize TTS for extension turns,
-    // fall back to macOS `say` so the watch always gets an audio reply.
-    if (extensionId && text && !audioDelivered) {
+    // When the channel pipeline doesn't synthesize TTS, fall back to macOS
+    // `say` so the watch always gets an audio reply for both regular and
+    // extension turns.
+    if (text && !audioDelivered) {
       const audioBytes = await synthesizeExtensionAudio(text);
-      if (audioBytes) this.sendExtensionResponse(extensionId, "audio", text, audioBytes.toString("base64"));
+      if (audioBytes) {
+        if (extensionId) {
+          this.sendExtensionResponse(extensionId, "audio", text, audioBytes.toString("base64"));
+        } else {
+          this.sendEncrypted(MSG.AUDIO_RESPONSE, audioBytes);
+        }
+      }
     }
   }
 
