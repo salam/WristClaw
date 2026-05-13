@@ -168,6 +168,92 @@ func (r *Relay) HandleWatchPoll(w http.ResponseWriter, req *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// HandleHostJoin lets an agent that isn't running the OpenClaw plugin claim
+// the host (role=0) slot for a session over plain HTTP. Pre-creates the
+// hostHTTP buffer so any watch→host frames that arrive while the agent is
+// between polls are kept until the next /host/poll.
+func (r *Relay) HandleHostJoin(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, joinFrameSize+1))
+	if err != nil || len(body) != joinFrameSize || body[16] != 0 {
+		http.Error(w, "bad join", http.StatusBadRequest)
+		return
+	}
+
+	var sessionID [16]byte
+	copy(sessionID[:], body[:16])
+	session := r.getOrCreate(sessionID)
+	session.joinHTTPHost()
+	log.Printf("joined sid=%.8x role=0 transport=http", sessionID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleHostSend accepts a single full data frame from an HTTP host and
+// forwards it to the watch peer (WS or HTTP-polling). Same packet shape and
+// encryption as the WebSocket transport; the relay only routes.
+func (r *Relay) HandleHostSend(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxMessageMB*1024*1024+1))
+	if err != nil {
+		http.Error(w, "read error", http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxMessageMB*1024*1024 {
+		http.Error(w, "message too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err := r.validate(body); err != nil {
+		http.Error(w, "bad packet", http.StatusBadRequest)
+		return
+	}
+
+	var sessionID [16]byte
+	copy(sessionID[:], body[:16])
+	session := r.getOrCreate(sessionID)
+	session.touchHTTPHost()
+	if err := session.forward(0, req.Context(), body); err != nil {
+		log.Printf("http host forward error sid=%.8x: %v", sessionID, err)
+		http.Error(w, "forward error", http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// HandleHostPoll long-polls for the next watch→host frame addressed to this
+// session's host. Returns 204 if no frame arrives within ~25 s so callers
+// can immediately reconnect (HTTP/1.1 keep-alive friendly).
+func (r *Relay) HandleHostPoll(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sid := req.URL.Query().Get("sid")
+	sessionID, err := parseUUID(sid)
+	if err != nil {
+		http.Error(w, "bad sid", http.StatusBadRequest)
+		return
+	}
+	session := r.getOrCreate(sessionID)
+	session.joinHTTPHost()
+
+	ctx, cancel := context.WithTimeout(req.Context(), 25*time.Second)
+	defer cancel()
+	data, ok := session.pollHTTPHost(ctx)
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
 func (r *Relay) validate(data []byte) error {
 	if len(data) < headerSize {
 		return fmt.Errorf("too short")

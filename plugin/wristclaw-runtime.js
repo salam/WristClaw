@@ -12,11 +12,57 @@ import { recordInboundSession } from "openclaw/plugin-sdk/conversation-runtime";
 import { runInboundReplyTurn } from "openclaw/plugin-sdk/inbound-reply-dispatch";
 import { dispatchReplyWithBufferedBlockDispatcher, finalizeInboundContext } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import { resolveStorePath } from "openclaw/plugin-sdk/config-runtime";
+import { synthesizeSpeech } from "openclaw/plugin-sdk/tts-runtime";
 import { MSG, WristClawCrypto, buildJoinFrame, decodePacket, encodePacket } from "./protocol.js";
 
 const log = createSubsystemLogger("wristclaw");
 const DEFAULT_RELAY_URL = "wss://relay.wristclaw.app/ws";
 const CHANNEL = "wristclaw";
+
+function stripMarkdown(text) {
+  return text
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*/g, "")
+    .replace(/__/g, "")
+    .replace(/~~([^~]+)~~/g, "$1")
+    .replace(/^[-*+]\s+/gm, "")
+    .replace(/^\d+\.\s+/gm, "")
+    .replace(/^>\s+/gm, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function detectLanguage(text) {
+  if (/[äöüÄÖÜß]/.test(text)) return "de";
+  const deWords = /\b(ich|du|er|sie|wir|ihr|die|der|das|ein|eine|nicht|auch|oder|und|für|mit|von|bei|wie|was|ist|war|hat|werden|sein|bitte|danke|ja|nein|heute|schon|noch|sehr|gut|kann|muss|soll|hallo|nochmal|genau)\b/i;
+  if (deWords.test(text)) return "de";
+  return "en";
+}
+
+function voiceForLang(lang) {
+  return lang === "de" ? "piper/karlsson" : "kokoro/af_bella";
+}
+
+// Parse [action:actionName key=value ...] markers from agent text.
+// Returns { clean: string, actions: Array<{action, params}> }.
+function parseLocalActions(text) {
+  const actions = [];
+  const clean = text.replace(/\[action:([^\]]+)\]/g, (_, body) => {
+    const parts = body.trim().split(/\s+/);
+    const action = parts[0];
+    const params = {};
+    for (const part of parts.slice(1)) {
+      const eq = part.indexOf("=");
+      if (eq > 0) params[part.slice(0, eq)] = part.slice(eq + 1);
+    }
+    actions.push({ action, params: Object.keys(params).length ? params : undefined });
+    return "";
+  }).replace(/\s{2,}/g, " ").trim();
+  return { clean, actions };
+}
 const HEADER_USER_CONTEXT = "[wristclaw]";
 const HEADER_AMBIENT_CONTEXT = "[ambient context]";
 const HEADER_USER_MESSAGE = "[user message]";
@@ -240,24 +286,73 @@ export function classifyMediaType(contentType) {
   return MSG.TEXT_RESPONSE;
 }
 
-async function synthesizeExtensionAudio(text) {
-  const base = `/tmp/wristclaw-ext-tts-${Date.now()}`;
-  const txtPath = `${base}.txt`;
-  const aiffPath = `${base}.aiff`;
-  const m4aPath = `${base}.m4a`;
-  try {
-    await fsp.writeFile(txtPath, text, "utf8");
-    await execAsync(`/usr/bin/say -f "${txtPath}" -o "${aiffPath}"`);
-    await execAsync(`/usr/bin/afconvert -f m4af -d aac "${aiffPath}" "${m4aPath}"`);
-    const bytes = await fsp.readFile(m4aPath);
-    log.info(`extension TTS synthesis ok: ${bytes.length} bytes for ${text.length} chars`);
-    return bytes;
-  } catch (err) {
-    log.warn(`extension TTS synthesis failed: ${String(err)}`);
-    return null;
-  } finally {
-    for (const p of [txtPath, aiffPath, m4aPath]) fsp.unlink(p).catch(() => {});
+const KOKORO_BIN = "/Users/gado/bin/kokoro-tts";
+const PIPER_BIN  = "/Users/gado/bin/piper-tts";
+
+const PIPER_VOICES = new Set(["karlsson", "thorsten", "amy", "siwis", "harri", "paola"]);
+const KOKORO_VOICES = new Set([
+  "af_bella", "af_alloy", "af_sky", "af_heart", "af_nova",
+  "am_adam", "am_michael",
+  "bf_emma", "bf_isabella", "bm_george", "bm_lewis",
+]);
+
+function parseTtsVoice(preferredVoice) {
+  if (!preferredVoice) return { engine: "kokoro", voice: "af_bella" };
+  const bare = preferredVoice.includes("/") ? preferredVoice.split("/").pop() : preferredVoice;
+  if (PIPER_VOICES.has(bare))  return { engine: "piper",  voice: bare };
+  if (KOKORO_VOICES.has(bare)) return { engine: "kokoro", voice: bare };
+  return { engine: "kokoro", voice: "af_bella" }; // unknown → default
+}
+
+async function synthesizeExtensionAudio(text, { cfg, preferredVoice } = {}) {
+  const m4aPath = `/tmp/wristclaw-tts-${Date.now()}.m4a`;
+  const { engine, voice } = parseTtsVoice(preferredVoice);
+
+  // 1a. Piper (German karlsson / thorsten, French siwis, etc.)
+  if (engine === "piper") {
+    try {
+      await execAsync(`"${PIPER_BIN}" -o "${m4aPath}" -v "${voice}" "${text.replace(/"/g, '\\"')}"`);
+      const bytes = await fsp.readFile(m4aPath);
+      log.info(`TTS via piper(${voice}) ok: ${bytes.length} bytes`);
+      return bytes;
+    } catch (err) {
+      log.warn(`TTS piper(${voice}) failed: ${String(err)}`);
+    } finally {
+      fsp.unlink(m4aPath).catch(() => {});
+    }
   }
+
+  // 1b. Kokoro local (af_bella, af_alloy, etc.) — English, loudnorm applied
+  if (engine === "kokoro") {
+    try {
+      await execAsync(`"${KOKORO_BIN}" -o "${m4aPath}" -v "${voice}" "${text.replace(/"/g, '\\"')}"`);
+      const bytes = await fsp.readFile(m4aPath);
+      log.info(`TTS via kokoro(${voice}) ok: ${bytes.length} bytes`);
+      return bytes;
+    } catch (err) {
+      log.warn(`TTS kokoro(${voice}) failed: ${String(err)}`);
+    } finally {
+      fsp.unlink(m4aPath).catch(() => {});
+    }
+  }
+
+  // 2. openclaw SDK provider (cloud fallback — openrouter/openai/etc.)
+  if (cfg) {
+    try {
+      const overrides = preferredVoice ? { voice: preferredVoice } : undefined;
+      const result = await synthesizeSpeech({ text, cfg, overrides });
+      if (result?.audio?.length) {
+        log.info(`TTS via SDK provider ok: ${result.audio.length} bytes`);
+        return result.audio;
+      }
+    } catch (err) {
+      log.warn(`TTS SDK provider failed: ${String(err)}`);
+    }
+  }
+
+  // No say fallback — intentionally omitted per voice preferences.
+  log.warn("TTS: all synthesis paths failed, returning null");
+  return null;
 }
 
 export class WristClawRelayClient {
@@ -272,6 +367,7 @@ export class WristClawRelayClient {
     this.abortController = new AbortController();
     this.latestContext = null;
     this.preferredModel = "";
+    this.preferredVoice = "";
     this.pushedExtensionIds = new Set();
     this.connected = false;
   }
@@ -412,6 +508,8 @@ export class WristClawRelayClient {
       this.latestContext = JSON.parse(plaintext.toString("utf8"));
       const model = this.latestContext?.preferredModel;
       if (typeof model === "string") this.preferredModel = model;
+      const voice = this.latestContext?.preferredVoice;
+      if (typeof voice === "string") this.preferredVoice = voice;
       return;
     }
     if (type === MSG.TEXT_INPUT) {
@@ -442,8 +540,15 @@ export class WristClawRelayClient {
 
   pushConfig() {
     const models = Object.keys(this.cfg.agents?.defaults?.models ?? {});
+    // Static voice list: piper + kokoro voices available on this host.
+    // Prefixed by engine so the iPhone picker can label them correctly.
+    const voices = [
+      "piper/karlsson", "piper/thorsten",
+      "kokoro/af_bella", "kokoro/af_alloy", "kokoro/af_sky",
+      "kokoro/af_heart", "kokoro/am_adam", "kokoro/bf_emma",
+    ];
     if (!models.length) return;
-    const payload = Buffer.from(JSON.stringify({ models }), "utf8");
+    const payload = Buffer.from(JSON.stringify({ models, voices }), "utf8");
     try {
       this.sendEncrypted(MSG.CONFIG, payload);
     } catch (err) {
@@ -467,9 +572,11 @@ export class WristClawRelayClient {
     const cfg = this.preferredModel ? withModelOverride(this.cfg, this.preferredModel) : this.cfg;
     const route = sessionRoute({ cfg, account: this.account, agentId });
     const storePath = resolveStorePath(cfg.session?.store, { agentId });
+    const lang = options.extensionId ? undefined : detectLanguage(text);
     const body = buildWristClawPrompt({
       userText: text,
       ambientContext: this.latestContext,
+      lang,
       terse: this.account.terse
     });
     const ctxPayload = finalizeInboundContext({
@@ -545,7 +652,13 @@ export class WristClawRelayClient {
   async deliverReplyPayload(payload, options = {}) {
     if (payload?.isReasoning) return;
     const extensionId = options.extensionId;
-    const text = typeof payload?.text === "string" ? payload.text : "";
+    const rawText = typeof payload?.text === "string" ? payload.text : "";
+    const { clean: text, actions: localActions } = parseLocalActions(rawText);
+    for (const { action, params } of localActions) {
+      try { this.sendLocalAction(action, params); } catch (err) {
+        log.warn(`localAction send failed (${action}): ${String(err)}`);
+      }
+    }
     const mediaUrls = [
       ...(Array.isArray(payload?.mediaUrls) ? payload.mediaUrls : []),
       ...(payload?.mediaUrl ? [payload.mediaUrl] : [])
@@ -577,7 +690,12 @@ export class WristClawRelayClient {
     // `say` so the watch always gets an audio reply for both regular and
     // extension turns.
     if (text && !audioDelivered) {
-      const audioBytes = await synthesizeExtensionAudio(text);
+      const ttsText = stripMarkdown(text);
+      const ttsVoice = this.preferredVoice || voiceForLang(detectLanguage(ttsText));
+      const audioBytes = await synthesizeExtensionAudio(ttsText, {
+        cfg: this.cfg,
+        preferredVoice: ttsVoice,
+      });
       if (audioBytes) {
         if (extensionId) {
           this.sendExtensionResponse(extensionId, "audio", text, audioBytes.toString("base64"));
@@ -586,6 +704,11 @@ export class WristClawRelayClient {
         }
       }
     }
+  }
+
+  sendLocalAction(action, params) {
+    const body = params ? { action, params } : { action };
+    this.sendEncrypted(MSG.LOCAL_ACTION, Buffer.from(JSON.stringify(body), "utf8"));
   }
 
   sendExtensionResponse(id, kind, text = "", payload = "") {

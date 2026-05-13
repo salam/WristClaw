@@ -21,6 +21,9 @@ func main() {
 	mux.HandleFunc("/watch/join", relay.HandleWatchJoin)
 	mux.HandleFunc("/watch/send", relay.HandleWatchSend)
 	mux.HandleFunc("/watch/poll", relay.HandleWatchPoll)
+	mux.HandleFunc("/host/join", relay.HandleHostJoin)
+	mux.HandleFunc("/host/send", relay.HandleHostSend)
+	mux.HandleFunc("/host/poll", relay.HandleHostPoll)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
