@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { exec as execCb } from "node:child_process";
@@ -13,7 +14,7 @@ import { runInboundReplyTurn } from "openclaw/plugin-sdk/inbound-reply-dispatch"
 import { dispatchReplyWithBufferedBlockDispatcher, finalizeInboundContext } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import { resolveStorePath } from "openclaw/plugin-sdk/config-runtime";
 import { synthesizeSpeech } from "openclaw/plugin-sdk/tts-runtime";
-import { MSG, WristClawCrypto, buildJoinFrame, decodePacket, encodePacket } from "./protocol.js";
+import { MSG, MAX_PAYLOAD_BYTES, WristClawCrypto, buildJoinFrame, decodePacket, encodePacket } from "./protocol.js";
 
 const log = createSubsystemLogger("wristclaw");
 const DEFAULT_RELAY_URL = "wss://relay.wristclaw.app/ws";
@@ -284,6 +285,54 @@ export function classifyMediaType(contentType) {
   if (type.startsWith("audio/")) return MSG.AUDIO_RESPONSE;
   if (type.startsWith("image/")) return MSG.IMAGE_THUMBNAIL;
   return MSG.TEXT_RESPONSE;
+}
+
+// Resize an image "to contain" within a byte budget: preserve aspect ratio,
+// shrink the longest edge, re-encode as JPEG, halving the dimension cap until
+// the bytes fit. The relay rejects any frame over MAX_MESSAGE_BYTES, and the
+// watch is a memory-constrained client — an agent can hand us a full-res photo,
+// so the channel is responsible for getting it down to something deliverable.
+// Uses macOS `sips`, consistent with the plugin's other shell-outs (say,
+// afconvert, kokoro/piper). Images already within budget pass through untouched.
+export async function resizeImageToFit(bytes, contentType, budget = MAX_PAYLOAD_BYTES) {
+  if (bytes.length <= budget) return { bytes, contentType };
+
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const tmpIn = path.join(os.tmpdir(), `wristclaw-img-in-${stamp}`);
+  await fsp.writeFile(tmpIn, bytes);
+
+  let best = null;
+  try {
+    let maxDim = 2000;
+    for (let attempt = 0; attempt < 6 && maxDim >= 64; attempt++) {
+      const tmpOut = path.join(os.tmpdir(), `wristclaw-img-out-${stamp}-${attempt}.jpg`);
+      try {
+        await execAsync(
+          `/usr/bin/sips -Z ${maxDim} -s format jpeg -s formatOptions 80 "${tmpIn}" --out "${tmpOut}"`
+        );
+        const out = await fsp.readFile(tmpOut);
+        if (!best || out.length < best.length) best = out;
+        if (out.length <= budget) {
+          log.info(`WristClaw image resized ${bytes.length} → ${out.length} bytes (longest edge ≤ ${maxDim}px)`);
+          return { bytes: out, contentType: "image/jpeg" };
+        }
+      } catch (err) {
+        log.warn(`WristClaw image resize attempt ${attempt} failed: ${String(err)}`);
+      } finally {
+        await fsp.rm(tmpOut, { force: true });
+      }
+      maxDim = Math.round(maxDim / 1.6);
+    }
+  } finally {
+    await fsp.rm(tmpIn, { force: true });
+  }
+
+  if (best) {
+    log.warn(`WristClaw image still ${best.length} > ${budget} bytes after resize — sending smallest attempt`);
+    return { bytes: best, contentType: "image/jpeg" };
+  }
+  log.warn("WristClaw image resize produced no output — sending original (relay may reject)");
+  return { bytes, contentType };
 }
 
 const KOKORO_BIN = "/Users/gado/bin/kokoro-tts";
@@ -678,12 +727,25 @@ export class WristClawRelayClient {
       }
       if (!media) continue;
       const msgType = classifyMediaType(media.contentType);
+      // Images can arrive at any resolution; the relay caps every frame at
+      // MAX_MESSAGE_BYTES and the watch is memory-constrained. Resize-to-
+      // contain so what we send is always deliverable. Audio/text untouched.
+      let outBytes = media.bytes;
+      if (msgType === MSG.IMAGE_THUMBNAIL) {
+        // The extension-response path base64-encodes the payload inside JSON
+        // (~4/3 larger), so it gets a tighter raw-bytes budget than a direct
+        // IMAGE_THUMBNAIL frame.
+        const budget = extensionId
+          ? Math.floor((MAX_PAYLOAD_BYTES - 256) * 3 / 4)
+          : MAX_PAYLOAD_BYTES;
+        outBytes = (await resizeImageToFit(media.bytes, media.contentType, budget)).bytes;
+      }
       if (extensionId) {
         const kind = msgType === MSG.AUDIO_RESPONSE ? "audio" : msgType === MSG.IMAGE_THUMBNAIL ? "image" : "text";
         if (kind === "audio") audioDelivered = true;
-        this.sendExtensionResponse(extensionId, kind, text || "Media", media.bytes.toString("base64"));
+        this.sendExtensionResponse(extensionId, kind, text || "Media", outBytes.toString("base64"));
       } else {
-        this.sendEncrypted(msgType, media.bytes);
+        this.sendEncrypted(msgType, outBytes);
       }
     }
     // When the channel pipeline doesn't synthesize TTS, fall back to macOS

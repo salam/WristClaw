@@ -24,6 +24,17 @@ export const JOIN_ROLE_HOST = 0;
 export const HKDF_INFO = Buffer.from("WristClaw-v1", "utf8");
 export const HKDF_SALT = Buffer.alloc(32);
 
+// Mirrors the Go relay's maxMessageMB (relay/server/relay.go). The relay
+// rejects any frame whose total wire size exceeds this — HTTP 413 on the
+// /host|watch/send endpoints, a read-limit close on the WebSocket transport.
+// Every sender must keep frames at or under it.
+export const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+
+// Largest plaintext payload that still fits inside one frame: the wire cap
+// minus the 37-byte header and the 16-byte ChaCha20-Poly1305 auth tag that
+// encrypt() appends. Senders of large payloads (images) must fit within this.
+export const MAX_PAYLOAD_BYTES = MAX_MESSAGE_BYTES - HEADER_SIZE - 16;
+
 export function uuidToBytes(uuid) {
   const normalized = String(uuid).trim().toLowerCase();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)) {
