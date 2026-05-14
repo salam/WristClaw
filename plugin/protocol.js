@@ -105,15 +105,34 @@ function createPublicKeyCompat(der) {
 }
 
 export class WristClawCrypto {
-  constructor() {
-    const { privateKey, publicKey } = generateKeyPairSync("x25519");
-    this.privateKey = privateKey;
-    this.publicKey = publicKey;
+  /// Pass a 32-byte raw X25519 private key to resume a previously persisted
+  /// identity, or omit to mint a fresh ephemeral pair. Persisting the raw
+  /// private key (Watch → UserDefaults, Host → ~/.openclaw/wristclaw/host-keys/)
+  /// makes the shared secret survive cold restarts on either side, so audio
+  /// buffered at the relay during a long agent turn can actually be decrypted
+  /// when the watch reconnects.
+  constructor(privateKeyRaw) {
+    if (privateKeyRaw) {
+      this.privateKey = keyObjectFromRawPrivate(privateKeyRaw);
+      // Derive the public key from the private one — Node's createPublicKey
+      // accepts a KeyObject and returns the matching public side.
+      this.publicKey = globalThis.__wristclawDerivePublicKey
+        ? globalThis.__wristclawDerivePublicKey(this.privateKey)
+        : __derivePublicKey(this.privateKey);
+    } else {
+      const { privateKey, publicKey } = generateKeyPairSync("x25519");
+      this.privateKey = privateKey;
+      this.publicKey = publicKey;
+    }
     this.sharedKey = null;
   }
 
   get publicKeyRaw() {
     return rawX25519PublicKey(this.publicKey);
+  }
+
+  get privateKeyRaw() {
+    return rawX25519PrivateKey(this.privateKey);
   }
 
   completeHandshake(peerPublicKeyRaw) {
@@ -147,6 +166,10 @@ export class WristClawCrypto {
 import { createPrivateKey, createPublicKey } from "node:crypto";
 globalThis.__wristclawCreatePrivateKey ??= (der) => createPrivateKey({ key: der, format: "der", type: "pkcs8" });
 globalThis.__wristclawCreatePublicKey ??= (der) => createPublicKey({ key: der, format: "der", type: "spki" });
+globalThis.__wristclawDerivePublicKey ??= (privateKeyObj) => createPublicKey(privateKeyObj);
+// Hoisted reference for the class above so it can derive a public key from a
+// resumed private one without going through the global shim if unset.
+function __derivePublicKey(privateKeyObj) { return createPublicKey(privateKeyObj); }
 
 export const _private = {
   rawX25519PrivateKey,

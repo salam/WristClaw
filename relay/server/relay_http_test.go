@@ -251,6 +251,101 @@ func TestHTTPHostPollDrainsPreArrivalBuffer(t *testing.T) {
 	}
 }
 
+func TestHostBuffersWhileWatchOffline(t *testing.T) {
+	// Regression: agent reply + TTS arrive (~10–30 s) after the watchOS app
+	// has already backgrounded and dropped its WebSocket. The relay must keep
+	// host→watch payloads until the watch reconnects — otherwise the audio
+	// packet lands on a dead connection and gets silently dropped.
+	relay := NewRelay()
+	srv := newTestServer(relay)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	sid := testSessionID()
+
+	// 1. Watch joins via WS then disconnects (simulating background suspend).
+	watchConn, _, err := websocket.Dial(ctx, wsURL(srv.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := watchConn.Write(ctx, websocket.MessageBinary, append(sid[:], 1)); err != nil {
+		t.Fatal(err)
+	}
+	watchConn.Close(websocket.StatusNormalClosure, "background")
+
+	// Give the server a moment to clear the peer registration.
+	time.Sleep(50 * time.Millisecond)
+
+	// 2. Host joins and sends a frame while watch is offline.
+	hostConn, _, err := websocket.Dial(ctx, wsURL(srv.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostConn.Close(websocket.StatusNormalClosure, "")
+	if err := hostConn.Write(ctx, websocket.MessageBinary, append(sid[:], 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	packet := testPacket(sid, 4, []byte("late-tts-audio"))
+	if err := hostConn.Write(ctx, websocket.MessageBinary, packet); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Watch reconnects (cold resume) and should receive the buffered packet.
+	time.Sleep(50 * time.Millisecond)
+	resumeConn, _, err := websocket.Dial(ctx, wsURL(srv.URL), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumeConn.Close(websocket.StatusNormalClosure, "")
+	if err := resumeConn.Write(ctx, websocket.MessageBinary, append(sid[:], 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, got, err := resumeConn.Read(ctx)
+	if err != nil {
+		t.Fatalf("watch never received buffered packet: %v", err)
+	}
+	if !bytes.Equal(got, packet) {
+		t.Fatal("watch received wrong packet after resume")
+	}
+}
+
+func TestWatchPromptRefreshesBufferTTL(t *testing.T) {
+	// Pure unit test on Session (no WS): when both peers are gone, the
+	// host→watch buffer is supposed to survive until watchBufferTTL elapses
+	// since the last sign of life from the watch. A watch→host frame is
+	// such a sign of life — it must reset the TTL clock so a slow reply
+	// (10–30 s of LLM + TTS) finds the session alive on reconnect.
+	sess := &Session{}
+	sid := testSessionID()
+
+	// Host buffers a reply for an offline watch → creates watchQueue, marks watchSeen.
+	reply := testPacket(sid, 4, []byte("audio-reply"))
+	if err := sess.forward(0, context.Background(), reply); err != nil {
+		t.Fatal(err)
+	}
+
+	// Age watchSeen past the TTL so the session would normally be reaped.
+	sess.mu.Lock()
+	sess.watchSeen = time.Now().Add(-(watchBufferTTL + time.Minute))
+	sess.mu.Unlock()
+	if !sess.isEmpty() {
+		t.Fatal("expected session to be empty before refresh")
+	}
+
+	// A new prompt from the watch must refresh the TTL.
+	prompt := testPacket(sid, 2, []byte("voice-prompt"))
+	if err := sess.forward(1, context.Background(), prompt); err != nil {
+		t.Fatal(err)
+	}
+	if sess.isEmpty() {
+		t.Fatal("watch→host forward did not refresh the TTL")
+	}
+}
+
 func newTestServer(relay *Relay) *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", relay.HandleWebSocket)

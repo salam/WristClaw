@@ -36,15 +36,72 @@ function stripMarkdown(text) {
     .trim();
 }
 
+// Word-count scoring instead of "any umlaut → German". Swiss place names like
+// Zürich / Rämistrasse / Bündner appear constantly in English replies and were
+// falsely triggering the Karlsson German voice on otherwise-English text.
+const DE_FUNCTION_WORDS = [
+  "ich", "du", "er", "sie", "wir", "ihr", "die", "der", "das", "den", "dem",
+  "ein", "eine", "einen", "einem", "einer", "nicht", "auch", "oder", "und",
+  "für", "mit", "von", "bei", "wie", "was", "wer", "wo", "wann", "warum",
+  "ist", "sind", "war", "waren", "hat", "haben", "werden", "wird", "wurde",
+  "sein", "bitte", "danke", "ja", "nein", "heute", "morgen", "gestern",
+  "schon", "noch", "sehr", "gut", "kann", "können", "muss", "müssen",
+  "soll", "sollen", "hallo", "nochmal", "genau", "aber", "weil", "doch",
+  "noch", "auf", "in", "an", "zu", "bis", "über", "unter", "nach",
+];
+const EN_FUNCTION_WORDS = [
+  "the", "a", "an", "i", "you", "he", "she", "we", "they", "it",
+  "is", "are", "was", "were", "be", "been", "have", "has", "had",
+  "do", "does", "did", "will", "would", "could", "should", "can", "may",
+  "and", "or", "but", "with", "from", "to", "for", "of", "in", "on", "at",
+  "by", "this", "that", "these", "those", "yes", "no", "please", "thanks",
+  "not", "if", "when", "where", "what", "why", "how", "about", "into",
+];
+
 function detectLanguage(text) {
-  if (/[äöüÄÖÜß]/.test(text)) return "de";
-  const deWords = /\b(ich|du|er|sie|wir|ihr|die|der|das|ein|eine|nicht|auch|oder|und|für|mit|von|bei|wie|was|ist|war|hat|werden|sein|bitte|danke|ja|nein|heute|schon|noch|sehr|gut|kann|muss|soll|hallo|nochmal|genau)\b/i;
-  if (deWords.test(text)) return "de";
-  return "en";
+  const lower = String(text || "").toLowerCase();
+  let de = 0;
+  let en = 0;
+  for (const w of DE_FUNCTION_WORDS) {
+    const m = lower.match(new RegExp(`\\b${w}\\b`, "g"));
+    if (m) de += m.length;
+  }
+  for (const w of EN_FUNCTION_WORDS) {
+    const m = lower.match(new RegExp(`\\b${w}\\b`, "g"));
+    if (m) en += m.length;
+  }
+  // Umlauts and ß are a weak nudge — only count if neither side has function-word
+  // evidence (covers single-word inputs like "Schöpfungstag").
+  if (de === 0 && en === 0 && /[äöüÄÖÜß]/.test(text)) return "de";
+  return de > en ? "de" : "en";
 }
 
 function voiceForLang(lang) {
   return lang === "de" ? "piper/karlsson" : "kokoro/af_bella";
+}
+
+// Which language a given TTS voice id belongs to. Used to override the user's
+// preferred voice when the agent replies in a different language than that
+// voice supports — speaking German with af_bella sounds wrong.
+const VOICE_LANG = {
+  "piper/karlsson": "de",
+  "piper/thorsten": "de",
+  "kokoro/af_bella": "en",
+  "kokoro/af_alloy": "en",
+  "kokoro/af_sky":   "en",
+  "kokoro/af_heart": "en",
+  "kokoro/am_adam":  "en",
+  "kokoro/bf_emma":  "en",
+};
+
+/// Pick the voice to actually send to TTS. If the user-selected voice matches
+/// the text's detected language, honor it; otherwise fall back to the default
+/// voice for that language so the German karlsson doesn't read English etc.
+function chooseVoice(preferredVoice, textLang) {
+  if (!preferredVoice) return voiceForLang(textLang);
+  const voiceLang = VOICE_LANG[preferredVoice];
+  if (voiceLang && voiceLang === textLang) return preferredVoice;
+  return voiceForLang(textLang);
 }
 
 // Parse [action:actionName key=value ...] markers from agent text.
@@ -217,16 +274,80 @@ export function formatAmbientContext(ctx) {
   return lines;
 }
 
+const WRISTCLAW_HEADER_SKILL_ROUTING = "[wristclaw skill routing — read FIRST]";
+const WRISTCLAW_HEADER_HARD_RULES = "[wristclaw hard rules]";
+
+/// Per-turn intent hints based on a quick keyword scan of the user text.
+/// For audio inputs the userText is the literal "<media:audio>..." placeholder
+/// (Claude transcribes internally), so these hints only fire on typed text.
+/// The general routing block below still applies to every turn.
+///
+/// CRITICAL framing: skills are FILES you load via the `read` tool, NOT tools
+/// you call. Multiple agent turns today failed by calling `send-image` as if
+/// it were a callable tool name and burning ~7 retries on "Tool send-image
+/// not found" before giving up. Spell it out every time.
+function buildIntentHints(userText) {
+  const t = String(userText || "").toLowerCase();
+  const hits = [];
+  if (/\b(picture|photo|image|foto|bild|zeig|schick|wie sieht|show me|send me)\b/.test(t)) {
+    hits.push("- this prompt looks like an image request. To get instructions, call the `read` tool with the FILE PATH `/Users/gado/.openclaw/workspace/skills/send-image/SKILL.md`. Do NOT call `send-image` as a tool — there is no such tool; `send-image` is the name of a skill *file* loaded by reading it. After reading, follow the playbook (Wikimedia / Google Images via the browser tool, save to /tmp), then end your reply with a single line `MEDIA:/tmp/<file>.jpg`.");
+  }
+  if (/\b(wo bin ich|where am i|where is matt|standort|location|find my)\b/.test(t)) {
+    hits.push("- this looks like a location query. Call `read` with path `/Users/gado/.openclaw/workspace/skills/findmyloc/SKILL.md` and follow it. (Not a tool — a SKILL.md file.)");
+  }
+  if (/\b(weather|wetter|regen|rain|temperatur|forecast)\b/.test(t)) {
+    hits.push("- this looks like a weather query. Call `read` with path `/Users/gado/.openclaw/skills/meteoswiss/SKILL.md` for Swiss locations.");
+  }
+  if (/\b(powerbank|akku(pack)?|chimpy)\b/.test(t)) {
+    hits.push("- this looks like a powerbank query. Call `read` with path `/Users/gado/.openclaw/skills/chimpy/SKILL.md`.");
+  }
+  if (/\b(am i late|bin ich (zu )?spät|next meeting|kalender|calendar)\b/.test(t)) {
+    hits.push("- this looks like a calendar query. Run `exec` with `/Users/gado/bin/wrist-next-event`; it wraps `gog calendar --all --today --json`, converts UTC→local, filters past events, prints one line. Then format the reply per the script's output (CURRENT / NEXT / NONE).");
+  }
+  return hits;
+}
+
 export function buildWristClawPrompt({ userText, ambientContext, lang, terse = true }) {
   const lines = [
     HEADER_USER_CONTEXT,
     "- surface: Apple Watch",
     "- output contract: answer for a wrist-sized screen; keep it short unless explicitly asked for detail",
     "- supported outbound modes: text, audio, image thumbnails, and extension-scoped responses",
-    "- when sending images, attach or link image media; when sending audio, prefer the channel TTS/audio payload when available"
+    "- when sending images, attach or link image media; when sending audio, prefer the channel TTS/audio payload when available",
   ];
   if (terse) lines.push("- default style: concise, direct, no filler");
   if (lang) lines.push(`- detected language: ${lang}`);
+
+  // Skill routing — repeated each turn because the openclaw system prompt's
+  // "Skills (mandatory)" rule gets lost in long conversation history; the
+  // agent then defaults to raw web_search/web_fetch and gives up. Each entry
+  // names the skill, its file location, and the trigger phrasing.
+  lines.push(
+    "",
+    WRISTCLAW_HEADER_SKILL_ROUTING,
+    "**Skills are markdown FILES, not tools.** To load a skill's instructions, call the `read` tool with the file's absolute path. Calling the skill name directly (e.g. `send-image(...)`) returns *Tool send-image not found* — never do that. Common intent → skill file:",
+    "- \"send/show me a photo/picture/image of X\" → read `/Users/gado/.openclaw/workspace/skills/send-image/SKILL.md`. Drives Chrome on the openclaw desktop to find a real Wikimedia/Google image, saves to /tmp, ends with a `MEDIA:/tmp/...` line that this adapter ships to the Visuals tab.",
+    "- \"where am I / where is Matt / device location\" → read `/Users/gado/.openclaw/workspace/skills/findmyloc/SKILL.md`.",
+    "- \"weather / Wetter / Regen / forecast\" → read `/Users/gado/.openclaw/skills/meteoswiss/SKILL.md` (Swiss locations).",
+    "- \"powerbank / Chimpy / Akkupack\" → read `/Users/gado/.openclaw/skills/chimpy/SKILL.md`.",
+    "- \"am I late / next meeting / kalender\" → call `exec` with `/Users/gado/bin/wrist-next-event`; it wraps `gog calendar --all --today --json`, converts UTC→local, filters past events, prints one line.",
+    "- generic `gog calendar` usage: default account is **gado@sala.ch** (no --account flag); Matthias's Arbeit/Familie/Privat are shared in. Use `--all` to see them.",
+  );
+
+  lines.push(
+    "",
+    WRISTCLAW_HEADER_HARD_RULES,
+    "- The `image_generate` tool is globally denied. Don't try it; it fails.",
+    "- Never emit `MEDIA:image-<digits>` or any placeholder string in place of a real path. The adapter only ships real `/tmp/<file>.jpg` paths or `https://...jpg` URLs; placeholders are silently dropped and the watch user sees nothing.",
+    "- If a tool refuses or returns no usable data, say so honestly (\"I couldn't find a photo of X\", \"Calendar isn't connected\") rather than fabricating.",
+    "- Reply in the user's detected language. The TTS engine picks a voice that matches the *reply text's* language; mixing languages picks the wrong voice for the mixed section.",
+  );
+
+  const intentHints = buildIntentHints(userText);
+  if (intentHints.length) {
+    lines.push("", "[wristclaw intent hints for THIS turn]", ...intentHints);
+  }
+
   lines.push("", HEADER_AMBIENT_CONTEXT, ...formatAmbientContext(ambientContext), "", HEADER_USER_MESSAGE, userText);
   return lines.join("\n");
 }
@@ -450,6 +571,78 @@ export class WristClawRelayClient {
     return this.seq;
   }
 
+  /// Persist *both* the X25519 private key and the most recent peer public
+  /// key per account, so the shared secret can be re-derived immediately on
+  /// process start — no waiting for an in-flight HANDSHAKE.
+  ///
+  /// Why both? Persisting only the private key still leaves sharedKey=null
+  /// until the watch's HANDSHAKE arrives; if the agent finishes a turn in
+  /// that gap (e.g. health-monitor cycled the channel mid-think), encrypt()
+  /// throws "crypto is not paired" and the response is dropped.
+  ///
+  /// X25519 is symmetric: priv_host × pub_watch == priv_watch × pub_host,
+  /// so as long as both sides cache the counterparty's public key, the
+  /// derived sharedKey is stable across restarts.
+  async loadOrCreateCrypto() {
+    const keyDir = path.join(stateRoot(), "host-keys");
+    const keyPath = path.join(keyDir, `${this.accountId}.key`);
+    const peerPath = path.join(keyDir, `${this.accountId}.peer.pub`);
+
+    let privateKeyRaw = null;
+    try {
+      const raw = await fsp.readFile(keyPath);
+      if (raw.length === 32) {
+        privateKeyRaw = raw;
+      } else {
+        log.warn(`Persisted host key at ${keyPath} has unexpected length ${raw.length}; regenerating`);
+      }
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        log.warn(`Failed to read persisted host key (${keyPath}): ${String(err)}`);
+      }
+    }
+
+    const crypto = privateKeyRaw ? new WristClawCrypto(privateKeyRaw) : new WristClawCrypto();
+    if (!privateKeyRaw) {
+      try {
+        await fsp.mkdir(keyDir, { recursive: true, mode: 0o700 });
+        await fsp.writeFile(keyPath, crypto.privateKeyRaw, { mode: 0o600 });
+        log.info(`Persisted new WristClaw host key for account=${this.accountId} at ${keyPath}`);
+      } catch (err) {
+        log.warn(`Failed to persist host key (${keyPath}): ${String(err)}`);
+      }
+    }
+
+    try {
+      const peerPub = await fsp.readFile(peerPath);
+      if (peerPub.length === 32) {
+        crypto.completeHandshake(peerPub);
+        log.info(`Resumed WristClaw shared secret for account=${this.accountId} from cached peer key`);
+      } else {
+        log.warn(`Persisted peer pubkey at ${peerPath} has unexpected length ${peerPub.length}; ignoring`);
+      }
+    } catch (err) {
+      if (err.code !== "ENOENT") {
+        log.warn(`Failed to read peer pubkey (${peerPath}): ${String(err)}`);
+      }
+    }
+    return crypto;
+  }
+
+  /// Cache the watch's public key on disk after a handshake completes, so the
+  /// next loadOrCreateCrypto() can derive the same sharedKey without waiting
+  /// for another HANDSHAKE round-trip.
+  async persistPeerPubKey(peerPubRaw) {
+    const keyDir = path.join(stateRoot(), "host-keys");
+    const peerPath = path.join(keyDir, `${this.accountId}.peer.pub`);
+    try {
+      await fsp.mkdir(keyDir, { recursive: true, mode: 0o700 });
+      await fsp.writeFile(peerPath, Buffer.from(peerPubRaw), { mode: 0o600 });
+    } catch (err) {
+      log.warn(`Failed to persist peer pubkey (${peerPath}): ${String(err)}`);
+    }
+  }
+
   async connectLoop() {
     activeWristClawClients.set(this.account.sessionId, this);
     while (!this.abortController.signal.aborted) {
@@ -467,7 +660,7 @@ export class WristClawRelayClient {
   }
 
   async connectOnce() {
-    this.crypto = new WristClawCrypto();
+    this.crypto = await this.loadOrCreateCrypto();
     const ws = new WebSocket(this.account.relayUrl);
     this.ws = ws;
     ws.binaryType = "arraybuffer";
@@ -489,8 +682,23 @@ export class WristClawRelayClient {
     });
     this.sendRaw(buildJoinFrame(this.account.sessionId));
     this.sendPlain(MSG.HANDSHAKE, this.crypto.publicKeyRaw);
-    this.connected = false;
-    this.setStatus({ running: true, connected: false, healthState: "waiting", lastEventAt: Date.now() });
+    // When loadOrCreateCrypto restored a paired sharedKey from cache, we can
+    // encrypt/decrypt immediately — no need to block on a fresh HANDSHAKE.
+    // Marking connected=true here also tells the SDK's health-monitor we're
+    // healthy, so it doesn't restart us every 10 min for "disconnected".
+    this.connected = Boolean(this.crypto.sharedKey);
+    this.setStatus({
+      running: true,
+      connected: this.connected,
+      healthState: this.connected ? "connected" : "waiting",
+      lastConnectedAt: this.connected ? Date.now() : undefined,
+      lastEventAt: Date.now(),
+    });
+    if (this.connected) {
+      // Re-broadcast extensions and config so a fresh watch connection sees them.
+      this.pushExtensions().catch((err) => log.warn(`pushExtensions failed: ${String(err)}`));
+      this.pushConfig();
+    }
 
     await new Promise((resolve, reject) => {
       ws.addEventListener("message", (event) => {
@@ -521,30 +729,60 @@ export class WristClawRelayClient {
   }
 
   sendEncrypted(type, payload) {
-    const { nonce, ciphertext } = this.crypto.encrypt(Buffer.from(payload));
-    this.sendRaw(encodePacket({
-      sessionId: this.account.sessionId,
-      type,
-      seq: this.nextSeq(),
-      nonce,
-      ciphertext
-    }));
+    try {
+      const { nonce, ciphertext } = this.crypto.encrypt(Buffer.from(payload));
+      const seq = this.nextSeq();
+      const wsState = this.ws?.readyState;
+      log.info(`sendEncrypted: type=0x${type.toString(16).padStart(2,"0")} seq=${seq} payloadLen=${payload.length} ctLen=${ciphertext.length} wsState=${wsState}`);
+      this.sendRaw(encodePacket({
+        sessionId: this.account.sessionId,
+        type,
+        seq,
+        nonce,
+        ciphertext
+      }));
+    } catch (err) {
+      log.warn(`sendEncrypted type=0x${type.toString(16).padStart(2,"0")} failed: ${String(err)}`);
+      throw err;
+    }
   }
 
   async handleRaw(raw) {
     const pkt = decodePacket(raw);
-    if (!pkt || pkt.sessionId !== this.account.sessionId) return;
+    if (!pkt) {
+      log.warn(`handleRaw: undecodable packet (len=${raw.length})`);
+      return;
+    }
+    if (pkt.sessionId !== this.account.sessionId) {
+      log.warn(`handleRaw: sessionId mismatch ours=${this.account.sessionId} pkt=${pkt.sessionId}`);
+      return;
+    }
+    log.info(`handleRaw: type=0x${pkt.type.toString(16).padStart(2,"0")} seq=${pkt.seq} ciphertextLen=${pkt.ciphertext.length} paired=${Boolean(this.crypto.sharedKey)}`);
     if (pkt.type === MSG.HANDSHAKE) {
       this.crypto.completeHandshake(pkt.ciphertext);
       this.sendPlain(MSG.HANDSHAKE, this.crypto.publicKeyRaw);
       this.connected = true;
       this.setStatus({ running: true, connected: true, healthState: "connected", lastConnectedAt: Date.now(), lastEventAt: Date.now() });
+      // Cache the watch's pubkey so a subsequent gateway restart can re-derive
+      // the shared secret immediately instead of waiting for another handshake
+      // — fixes "crypto is not paired" errors when the agent finishes a turn
+      // during the post-restart gap.
+      this.persistPeerPubKey(pkt.ciphertext).catch(() => {});
       await this.pushExtensions();
       this.pushConfig();
       return;
     }
     if (pkt.type === MSG.HEARTBEAT) {
       this.sendPlain(MSG.HEARTBEAT, Buffer.alloc(0));
+      // Update lastEventAt so health-monitor doesn't think a quiet but
+      // connected channel is dead — without this, a watch that's polling
+      // happily but not sending app-level traffic gets the provider torn
+      // down every 10 min.
+      this.setStatus({
+        running: true,
+        connected: true,
+        lastEventAt: Date.now(),
+      });
       return;
     }
     const plaintext = this.crypto.decrypt(pkt.nonce, pkt.ciphertext);
@@ -702,16 +940,34 @@ export class WristClawRelayClient {
     if (payload?.isReasoning) return;
     const extensionId = options.extensionId;
     const rawText = typeof payload?.text === "string" ? payload.text : "";
-    const { clean: text, actions: localActions } = parseLocalActions(rawText);
+    const { clean: textNoActions, actions: localActions } = parseLocalActions(rawText);
     for (const { action, params } of localActions) {
       try { this.sendLocalAction(action, params); } catch (err) {
         log.warn(`localAction send failed (${action}): ${String(err)}`);
       }
     }
+    // Fallback markdown-image extractor: the upstream channel-reply-pipeline
+    // sometimes does not populate payload.mediaUrls for extension flows,
+    // leaving an image URL inline in the text that the watch then shows as
+    // raw markdown instead of in the Visuals tab. Always scan the text here
+    // so a `![](https://…png)` link reliably arrives as an image.
+    const inlineUrls = [];
+    let text = textNoActions;
+    text = text.replace(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/g, (_, url) => {
+      inlineUrls.push(url);
+      return "";
+    });
+    text = text.replace(/\n{3,}/g, "\n\n").trim();
     const mediaUrls = [
       ...(Array.isArray(payload?.mediaUrls) ? payload.mediaUrls : []),
-      ...(payload?.mediaUrl ? [payload.mediaUrl] : [])
+      ...(payload?.mediaUrl ? [payload.mediaUrl] : []),
+      ...inlineUrls,
     ];
+    // Dedupe while preserving order.
+    const seen = new Set();
+    for (let i = mediaUrls.length - 1; i >= 0; i--) {
+      if (seen.has(mediaUrls[i])) mediaUrls.splice(i, 1); else seen.add(mediaUrls[i]);
+    }
     if (text) {
       if (extensionId) this.sendExtensionResponse(extensionId, "text", text);
       else this.sendEncrypted(MSG.TEXT_RESPONSE, Buffer.from(text, "utf8"));
@@ -753,7 +1009,7 @@ export class WristClawRelayClient {
     // extension turns.
     if (text && !audioDelivered) {
       const ttsText = stripMarkdown(text);
-      const ttsVoice = this.preferredVoice || voiceForLang(detectLanguage(ttsText));
+      const ttsVoice = chooseVoice(this.preferredVoice, detectLanguage(ttsText));
       const audioBytes = await synthesizeExtensionAudio(ttsText, {
         cfg: this.cfg,
         preferredVoice: ttsVoice,
