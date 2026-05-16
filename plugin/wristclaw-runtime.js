@@ -282,264 +282,81 @@ export function formatAmbientContext(ctx) {
   return lines;
 }
 
-const WRISTCLAW_HEADER_SKILL_ROUTING = "[wristclaw skill routing — read FIRST]";
-const WRISTCLAW_HEADER_HARD_RULES = "[wristclaw hard rules]";
+// Prompt fragments (skill routing, hard rules, per-turn intent hints) are
+// loaded from JSON config at module load. Resolution order:
+//   1. $WRISTCLAW_INTENTS_FILE
+//   2. ~/.openclaw/wristclaw-intents.json   (per-user overrides)
+//   3. <packageRoot>/wristclaw-intents.default.json   (bundled defaults)
+//
+// JSON schema:
+//   { skillRouting: { header, preamble, entries: [string] },
+//     hardRules:    { header, entries: [string] },
+//     intentHints:  [ { re, flags?, exclusive?, hint } ] }
+//
+// `re` is a JS regex source string (input is lowercased before .test(), so
+// flags default to ""). `exclusive` is a bucket name — within one prompt
+// build, only the first matching entry per bucket fires (useful for
+// mutually-exclusive intents like "image" vs "satellite-image"). Multiple
+// non-exclusive entries can all match the same turn.
+function loadWristClawHints() {
+  const tried = [];
+  const candidates = [
+    process.env.WRISTCLAW_INTENTS_FILE,
+    path.join(os.homedir(), ".openclaw", "wristclaw-intents.json"),
+    path.join(packageRoot(), "wristclaw-intents.default.json"),
+  ].filter(Boolean);
 
-/// Per-turn intent hints based on a quick keyword scan of the user text.
-/// Hybrid model: each match injects a COMPACT inline procedure (the "fast
-/// path" — 1 LLM round-trip), with a fallback `read /…/SKILL.md` mentioned
-/// only for edge cases that need a longer playbook (slow path).
-///
-/// CRITICAL framing: skills are FILES you load via the `read` tool, NOT tools
-/// you call. Multiple agent turns today failed by calling `send-image` as if
-/// it were a callable tool name and burning ~7 retries on "Tool send-image
-/// not found" before giving up. Spell it out every time.
-///
-/// Order matters: more specific patterns first (e.g. "satellite/aerial" wins
-/// over generic "image"). The first matching entry wins for mutually exclusive
-/// intents; non-exclusive ones (e.g. shopping list + timer) can both fire.
-const INTENT_HINTS = [
-  // ─── Imagery / maps ─────────────────────────────────────────────────────
-  {
-    re: /\b(satellit(e|en|enbild)?|aerial|luftbild|vom oben|from above|from the sky|map of (here|me|my location)|karte von (hier|mir))\b/,
-    exclusive: "image",
-    hint: [
-      "this is a satellite/aerial-map request.",
-      "  1. Use lat/lon from `[ambient context]` (\"here\"/\"my location\") or geocode a named place.",
-      "  2. `browser action=open label=maps url=https://www.google.com/maps/@<lat>,<lon>,16z/data=!3m1!1e3` (satellite view).",
-      "  3. `browser action=snapshot targetId=maps`, wait ~1.5s for tiles, `browser action=screenshot targetId=maps path=/tmp/satellite-<unix_ms>.png`.",
-      "  4. Reply: \"You are at <lat>,<lon> in <placename>. Here's the satellite image.\\nMEDIA:/tmp/satellite-<unix_ms>.png\"",
-      "  Edge cases (captcha, geocode collision, tile timeout): read /Users/gado/WristClaw/openclaw/skills/send-satellite/SKILL.md.",
-    ].join("\n"),
-  },
-  {
-    re: /\b(picture|photo|image|foto|bild|zeig|schick|wie sieht|show me|send me)\b/,
-    exclusive: "image",
-    hint: [
-      "this is a stock-photo request (not a map screenshot — for those see the satellite hint).",
-      "  Skills are FILES, not tools. Call `read` with /Users/gado/.openclaw/workspace/skills/send-image/SKILL.md and follow it:",
-      "  Wikimedia Commons → fallback Google Images → save to /tmp → end reply with `MEDIA:/tmp/<file>.jpg`.",
-    ].join("\n"),
-  },
+  for (const p of candidates) {
+    tried.push(p);
+    try {
+      if (!fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, "utf8");
+      const parsed = JSON.parse(raw);
+      return normalizeWristClawHints(parsed, p);
+    } catch (e) {
+      log.warn?.({ path: p, error: e.message }, "failed to load wristclaw hints");
+    }
+  }
+  log.warn?.({ tried }, "no wristclaw hints config found; using empty defaults");
+  return normalizeWristClawHints({}, "<empty>");
+}
 
-  // ─── Location ───────────────────────────────────────────────────────────
-  {
-    re: /\b(wo bin ich|where am i|standort|find my|wo ist (mein|meine|meinen|meinem)|where('s| is) my)\b/,
-    hint: [
-      "this is a device/self-location query.",
-      "  1. The `[ambient context]` block already lists every tracked device with lat/lon, address, age.",
-      "  2. Match the keyword to a device (Keys M = your keys, AirPods = headphones, MacBook = laptop, iPhone Matt = phone, etc.).",
-      "  3. Reply: \"<device> is at <addr>, <age> ago\". If the fix is [old fix] >6h say so honestly.",
-      "  Edge cases: read /Users/gado/.openclaw/workspace/skills/findmyloc/SKILL.md.",
-    ].join("\n"),
-  },
+function normalizeWristClawHints(cfg, sourcePath) {
+  const skillRouting = {
+    header: cfg?.skillRouting?.header || "[wristclaw skill routing]",
+    preamble: cfg?.skillRouting?.preamble || "",
+    entries: Array.isArray(cfg?.skillRouting?.entries) ? cfg.skillRouting.entries.filter(s => typeof s === "string") : [],
+  };
+  const hardRules = {
+    header: cfg?.hardRules?.header || "[wristclaw hard rules]",
+    entries: Array.isArray(cfg?.hardRules?.entries) ? cfg.hardRules.entries.filter(s => typeof s === "string") : [],
+  };
+  const intentHints = (Array.isArray(cfg?.intentHints) ? cfg.intentHints : []).map((entry, i) => {
+    if (!entry || typeof entry.re !== "string" || typeof entry.hint !== "string") {
+      log.warn?.({ source: sourcePath, index: i }, "skipping invalid intent hint entry");
+      return null;
+    }
+    try {
+      return {
+        re: new RegExp(entry.re, typeof entry.flags === "string" ? entry.flags : ""),
+        exclusive: entry.exclusive || null,
+        hint: entry.hint,
+      };
+    } catch (e) {
+      log.warn?.({ source: sourcePath, index: i, re: entry.re, error: e.message }, "skipping invalid intent hint regex");
+      return null;
+    }
+  }).filter(Boolean);
+  return { source: sourcePath, skillRouting, hardRules, intentHints };
+}
 
-  // ─── Calendar / am I late ───────────────────────────────────────────────
-  {
-    re: /\b(am i late|bin ich (zu )?spät|next meeting|nächster termin|kalender|calendar|schaffe ich|make it in time)\b/,
-    hint: [
-      "this is an 'am I late' / calendar query. Fast path (one LLM turn):",
-      "  1. `exec /Users/gado/bin/wrist-next-event` → ONE line in shape `CURRENT|NEXT|NONE HH:MM <name>  in N min|ends in N min`.",
-      "  2. If NEXT with a location/address, `exec /Users/gado/bin/maps-eta <lat>,<lon> \"<addr>\" --terse` (use ambient lat/lon). It prints: `<dest>: walk ~Xh · bike ~Xh · transit Xh · drive ~Xh` — transit is SBB Swiss real-time, others are crude straight-line estimates (marked ~).",
-      "  3. slack = start_iso − now − 3 min. ✅ if min(transit,drive) ≤ slack else ⚠️.",
-      "  4. Reply (de default, follow user lang): \"<title> in <Δmin> @ <where>. ÖV <eta_t> · Velo <eta_b> · Auto <eta_c>\". Mark the fastest with ✓.",
-    ].join("\n"),
-  },
+const WRISTCLAW_HINTS = loadWristClawHints();
 
-  // ─── Transit / directions ───────────────────────────────────────────────
-  {
-    re: /\b(how do i get to|wie komme ich (nach|zu)|wegbeschreibung|directions to|öv (nach|zu)|next sbb|next train|nächster zug|nächste verbindung)\b/,
-    hint: [
-      "this is a transit/directions query.",
-      "  1. `exec /Users/gado/bin/maps-eta <origin_lat>,<origin_lon> \"<dest>\" --terse` (origin = ambient lat/lon).",
-      "  2. Output is one line: `<dest>: walk ~X · bike ~X · transit X · drive ~X` (transit is real SBB times; walk/bike/drive are crude straight-line × detour, marked ~).",
-      "  3. Reply terse: `<dest>: ÖV <t> ✓ · Velo <b> · Auto <c> · Fuss <w>` (mark fastest with ✓, drop unrealistic modes for long distances).",
-      "  4. Edge case (non-Swiss destination, no transit): only walk/bike/drive will be populated; transit will say 'no transit connections found'. Say so honestly.",
-    ].join("\n"),
-  },
-
-  // ─── Weather ────────────────────────────────────────────────────────────
-  {
-    re: /\b(weather|wetter|regen|rain|temperatur|forecast|sonne|sun|schnee|snow)\b/,
-    hint: [
-      "this is a weather query (Swiss locations).",
-      "  Fast path: `exec meteoswiss current <postcode_or_lat_lon>` for now → `exec meteoswiss forecast <loc>` for outlook → `exec meteoswiss precipitation <loc>` for rain ETA.",
-      "  Edge cases (radar, hazards, pollen, multi-day, foreign country): read /Users/gado/.openclaw/skills/meteoswiss/SKILL.md.",
-    ].join("\n"),
-  },
-
-  // ─── Powerbank ──────────────────────────────────────────────────────────
-  {
-    re: /\b(powerbank|akku(pack)?|chimpy)\b/,
-    hint: "this is a Chimpy/powerbank query. Read /Users/gado/.openclaw/skills/chimpy/SKILL.md.",
-  },
-
-  // ─── Communication (WhatsApp / email) ───────────────────────────────────
-  {
-    re: /\b(send (a )?whatsapp|wa to|send a message to|schick (whatsapp|nachricht) (an|zu)|sag (.*?) (auf )?whatsapp)\b/,
-    hint: [
-      "this is an outbound WhatsApp request.",
-      "  1. Resolve recipient name → JID: first try `~/.openclaw/contacts.json` (lookup by lowercase name/alias); if absent, try `wacli contacts list --json` and fuzzy-match; else ask the user for the number.",
-      "  2. `wacli send text --to <jid> --message \"<text>\"`.",
-      "  3. Reply terse: \"✓ sent to <name>\" or \"✗ <error>\".",
-    ].join("\n"),
-  },
-  {
-    re: /\b(read my (last )?(whatsapp|messages?|nachrichten)|inbox|posteingang|recent messages)\b/,
-    hint: [
-      "this is an inbound message peek.",
-      "  Fast path WhatsApp: `wacli sync --once` then `wacli messages list --limit 3 --json` → 3 lines \"<sender>: <text>\".",
-      "  For email also try `himalaya list --max-width 60 --size 5`.",
-    ].join("\n"),
-  },
-  {
-    re: /\b(reply (to|with)|antworte (auf|mit)|reagiere mit)\b/,
-    hint: [
-      "this is a reply request.",
-      "  1. `wacli sync --once` to refresh local DB.",
-      "  2. `wacli messages list --limit 1 --json` to get last inbound `id` + `chat_jid` + `sender_jid`.",
-      "  3. `wacli send text --to <chat_jid> --reply-to <id> --reply-to-sender <sender_jid> --message \"<text>\"`.",
-      "  4. Reply terse: \"✓ replied\".",
-    ].join("\n"),
-  },
-
-  // ─── Reminders / lists / timers ─────────────────────────────────────────
-  {
-    re: /\b(remind me|erinner mich|reminder|notiz|note to self)\b/,
-    hint: [
-      "this is a reminder request.",
-      "  Time-bound (\"in 10 min\" / \"at 14:00\"): `echo 'wacli send text --to <self_jid> --message \"⏰ <text>\"' | at <when>`.",
-      "  Open-ended (\"remember that X\"): `echo \"$(date +%F\\ %T)  <text>\" >> ~/.openclaw/notes/inbox.md`.",
-      "  Reply: \"⏰ <when>: <text>\" or \"📝 noted\".",
-    ].join("\n"),
-  },
-  {
-    re: /\b(shopping list|einkaufsliste|add to list|grocer(y|ies))\b/,
-    hint: [
-      "this is a shopping-list op.",
-      "  Add: `echo \"<item>\" >> ~/.openclaw/lists/shopping.txt`. Reply \"➕ <item>\".",
-      "  Read: `cat ~/.openclaw/lists/shopping.txt | tail -20`. Reply as a bullet list.",
-      "  Clear: `: > ~/.openclaw/lists/shopping.txt`. Reply \"🗑️ cleared\".",
-    ].join("\n"),
-  },
-  {
-    re: /\b(timer|stopuhr|count down|countdown)\b/,
-    hint: [
-      "this is a timer request.",
-      "  `nohup sh -c 'sleep <secs> && osascript -e \"display notification \\\"⏱️ time\\\" with title \\\"Timer\\\"\" && wacli send text --to <self_jid> --message \"⏱️ <duration_label> elapsed\"' &`",
-      "  Reply: \"⏱️ <duration> set\".",
-    ].join("\n"),
-  },
-  {
-    re: /\b(my notes|meine notizen|what (did|have) i (write|note(d)?|jot)|search notes)\b/,
-    hint: "search notes: `grep -r -i -l \"<term>\" ~/.openclaw/notes/ 2>/dev/null | head -5`, then `head -10 <file>` on each hit. Reply with 1-line excerpts.",
-  },
-
-  // ─── Quick lookups ──────────────────────────────────────────────────────
-  {
-    re: /\b(translate to|übersetz(e)? (nach|auf|ins)|in (englisch|english|french|französisch|italian|italienisch|spanish|spanisch|german|deutsch))\b/,
-    hint: "translation: `trans -no-warn -b -t <target_lang_code> \"<text>\"`. Reply with just the translated text.",
-  },
-  {
-    re: /\b((chf|eur|usd|gbp|btc|eth) in (chf|eur|usd|gbp|btc|eth)|exchange rate|wechselkurs|kurs (von|für))\b/,
-    hint: "FX rate: `curl -s \"https://api.frankfurter.dev/v1/latest?from=<FROM>&to=<TO>\" | jq -r '.rates.<TO>'`. Reply: \"1 <FROM> = <rate> <TO>\".",
-  },
-  {
-    re: /\b(time in|wieviel uhr in|what time is it in|zeit in)\b/,
-    hint: "world time: `TZ=<area/city> date \"+%H:%M %Z (%a %d %b)\"`. Reply: \"<H:M> in <city>\".",
-  },
-  {
-    re: /\b(stock price|aktien(kurs)?|share price|kurs (aapl|tsla|msft|googl|nvda|btc|eth))\b/,
-    hint: "stock: `curl -s \"https://stooq.com/q/l/?s=<symbol>&i=d&f=sd2t2ohlcv&h&e=csv\" | tail -1 | cut -d',' -f7`. Reply: \"<symbol>: <price>\".",
-  },
-
-  // ─── Computer / home control ────────────────────────────────────────────
-  {
-    re: /\b(pause music|play music|skip (track|song)|nächstes lied|vorheriges lied|stop spotify)\b/,
-    hint: "music control: `osascript -e 'tell app \"Spotify\" to playpause'` (or `next track` / `previous track`). Reply: \"⏯️ <state>\".",
-  },
-  {
-    re: /\b(lock (my )?mac|sperren?|screensaver|bildschirm sperren)\b/,
-    hint: "lock Mac: `osascript -e 'tell application \"System Events\" to keystroke \"q\" using {control down, command down}'`. Reply: \"🔒 locked\".",
-  },
-
-  // ─── Coding / DevOps ────────────────────────────────────────────────────
-  {
-    re: /\b(deploy|ship( it)?|release|push to (prod|main))\b/,
-    hint: [
-      "this is a deploy request.",
-      "  1. Confirm a project name in the request. If ambiguous, list `ls ~/code/` and ask.",
-      "  2. `cd ~/code/<project> && claude --prompt /ship` (or follow project-local CONTRIBUTING.md).",
-      "  3. Reply with last few lines of ship output.",
-      "  Don't auto-deploy on a fresh /reset — confirm first.",
-    ].join("\n"),
-  },
-  {
-    re: /\b(ci status|pipeline status|build status|github actions|tests passing)\b/,
-    hint: "CI: `gh run list --repo <repo> --limit 1 --json status,conclusion,workflowName,createdAt`. Reply: \"<workflow>: <conclusion>\".",
-  },
-  {
-    re: /\b((my )?open prs?|pull requests?|pr review|review queue)\b/,
-    hint: "open PRs: `gh pr list --author @me --state open --json title,url,statusCheckRollup | jq -r '.[] | \"\\(.title) — \\(.url)\"'`. Reply with each on its own line.",
-  },
-  {
-    re: /\b(what did i ship|what did i commit|recent commits|commits today)\b/,
-    hint: "today's commits: `find ~/code -maxdepth 4 -name .git -type d | while read d; do (cd \"$(dirname \"$d\")\" && git log --since=midnight --author=Gado --oneline 2>/dev/null); done | head -10`.",
-  },
-  {
-    re: /\b(new project|create (a )?project|start coding|develop (something|software))\b/,
-    hint: [
-      "this is a new-project request (per memory: every new project gets a private GitHub repo + salam as collaborator).",
-      "  1. Ask for a name (kebab-case). Check `gh repo view salam/<name>` — if it exists, clone to ~/code; else:",
-      "     `gh repo create salam/<name> --private --add-readme && \\",
-      "      gh api -X PUT repos/salam/<name>/collaborators/salam --raw-field permission=push && \\",
-      "      gh repo clone salam/<name> ~/code/<name>`.",
-      "  2. `cd ~/code/<name>`; the README from --add-readme gives you a non-empty initial commit.",
-      "  3. Hand off: \"created at ~/code/<name>; private; salam invited\". Optionally `claude /code/<name>` to open in claude-code.",
-    ].join("\n"),
-  },
-
-  // ─── Meta ───────────────────────────────────────────────────────────────
-  {
-    re: /\b(what can you do|hilfe|help me|capabilities|was kannst du)\b/,
-    hint: "self-describe: enumerate the SKILL.md files under /Users/gado/.openclaw/workspace/skills/ and /Users/gado/.openclaw/skills/ — one line each: \"<name>: <description from frontmatter>\".",
-  },
-  {
-    re: /\b(make (a )?shortcut|add (a )?(watch )?extension|extension hinzufügen|tap shortcut)\b/,
-    hint: [
-      "this is a wristclaw extension creation request.",
-      "  Extensions live in `/Users/gado/WristClaw/openclaw/extensions.json` — an array of {id, title, icon, buttonLabel, prompt, agentPrompt}.",
-      "  1. `read` that file, parse JSON, append a new entry with: id=\"ext-<slug>\", title=<short>, icon=<SFSymbol like \"clock.badge.exclamationmark\">, buttonLabel=<≤14 chars>, prompt=<one-line description shown in picker>, agentPrompt=<what the LLM should do when the user taps it>.",
-      "  2. Write the file back (pretty-printed JSON, indent 2).",
-      "  3. `exec /Users/gado/bin/wristclaw-push` — re-pushes the extension catalog to the watch immediately (otherwise the watch picks up the change on next reconnect, ~5 min).",
-      "  4. Reply: \"➕ added '<title>'\".",
-    ].join("\n"),
-  },
-  {
-    re: /\b(slow down|be brief|kürzer|sei kürzer|terse|be terse)\b/,
-    hint: [
-      "user wants terser replies. Persist via `~/.openclaw/openclaw.json` channels.wristclaw.accounts.default.terse = true:",
-      "  `tmp=$(mktemp) && jq '.channels.wristclaw.accounts.default.terse = true' ~/.openclaw/openclaw.json > $tmp && mv $tmp ~/.openclaw/openclaw.json` then `openclaw gateway restart`.",
-      "  Reply: \"📐 terse mode on.\"",
-    ].join("\n"),
-  },
-  {
-    re: /\b(in (german|deutsch|english|englisch|french|französisch|italian|italienisch)|antworte (auf|in))\b/,
-    hint: "change reply language for THIS turn: just reply in that language. To persist, set `channels.wristclaw.accounts.default.preferredLang` in ~/.openclaw/openclaw.json (jq + gateway restart) — but usually session-local is enough.",
-  },
-
-  // ─── Cost / health ──────────────────────────────────────────────────────
-  {
-    re: /\b(usage today|how much have i (used|spent)|claude.*usage|api cost|verbraucht heute)\b/,
-    hint: "usage: `curl -s https://claude.ai/usage 2>/dev/null` (cookie auth) or quick proxy from /Users/gado/claude-proxy/index.js logs. Reply: \"<used>% of plan; <remaining>$.\"",
-  },
-];
-
-function buildIntentHints(userText, _ambientContext) {
+function buildIntentHints(userText) {
   const t = String(userText || "").toLowerCase();
   const hits = [];
   const exclusiveFired = new Set();
-  for (const entry of INTENT_HINTS) {
+  for (const entry of WRISTCLAW_HINTS.intentHints) {
     if (entry.exclusive && exclusiveFired.has(entry.exclusive)) continue;
     if (!entry.re.test(t)) continue;
     hits.push("- " + entry.hint);
@@ -559,31 +376,20 @@ export function buildWristClawPrompt({ userText, ambientContext, lang, terse = t
   if (terse) lines.push("- default style: concise, direct, no filler");
   if (lang) lines.push(`- detected language: ${lang}`);
 
-  // Skill routing — repeated each turn because the openclaw system prompt's
-  // "Skills (mandatory)" rule gets lost in long conversation history; the
-  // agent then defaults to raw web_search/web_fetch and gives up. Each entry
-  // names the skill, its file location, and the trigger phrasing.
-  lines.push(
-    "",
-    WRISTCLAW_HEADER_SKILL_ROUTING,
-    "**Skills are markdown FILES, not tools.** To load a skill's instructions, call the `read` tool with the file's absolute path. Calling the skill name directly (e.g. `send-image(...)`) returns *Tool send-image not found* — never do that. Common intent → skill file:",
-    "- \"send/show me a photo/picture/image of X\" → read `/Users/gado/.openclaw/workspace/skills/send-image/SKILL.md`. Drives Chrome on the openclaw desktop to find a real Wikimedia/Google image, saves to /tmp, ends with a `MEDIA:/tmp/...` line that this adapter ships to the Visuals tab.",
-    "- \"satellite image / aerial view / Luftbild / Satellitenbild / map of <here|place> / vom oben\" → read `/Users/gado/WristClaw/openclaw/skills/send-satellite/SKILL.md`. Drives Chrome to Google Maps satellite view at a real lat/lon (from findmyloc ambient context for \"here\", or a place name), screenshots the live tiles to /tmp, ends with `MEDIA:/tmp/...png`. **Different from send-image**: this is a real-time map screenshot at actual coordinates, not a stock photo.",
-    "- \"where am I / where is Matt / device location\" → read `/Users/gado/.openclaw/workspace/skills/findmyloc/SKILL.md`.",
-    "- \"weather / Wetter / Regen / forecast\" → read `/Users/gado/.openclaw/skills/meteoswiss/SKILL.md` (Swiss locations).",
-    "- \"powerbank / Chimpy / Akkupack\" → read `/Users/gado/.openclaw/skills/chimpy/SKILL.md`.",
-    "- \"am I late / next meeting / kalender\" → call `exec` with `/Users/gado/bin/wrist-next-event`; it wraps `gog calendar --all --today --json`, converts UTC→local, filters past events, prints one line.",
-    "- generic `gog calendar` usage: default account is **gado@sala.ch** (no --account flag); Matthias's Arbeit/Familie/Privat are shared in. Use `--all` to see them.",
-  );
+  // Skill routing — repeated each turn because the host's "Skills" system-prompt
+  // rule gets lost in long conversation history; the agent then defaults to raw
+  // web_search/web_fetch and gives up. Entries are sourced from the JSON config
+  // so the user can list their own skill files / binaries without forking this code.
+  const { skillRouting, hardRules } = WRISTCLAW_HINTS;
+  if (skillRouting.entries.length || skillRouting.preamble) {
+    lines.push("", skillRouting.header);
+    if (skillRouting.preamble) lines.push(skillRouting.preamble);
+    if (skillRouting.entries.length) lines.push(...skillRouting.entries);
+  }
 
-  lines.push(
-    "",
-    WRISTCLAW_HEADER_HARD_RULES,
-    "- The `image_generate` tool is globally denied. Don't try it; it fails.",
-    "- Never emit `MEDIA:image-<digits>` or any placeholder string in place of a real path. The adapter only ships real `/tmp/<file>.jpg` paths or `https://...jpg` URLs; placeholders are silently dropped and the watch user sees nothing.",
-    "- If a tool refuses or returns no usable data, say so honestly (\"I couldn't find a photo of X\", \"Calendar isn't connected\") rather than fabricating.",
-    "- Reply in the user's detected language. The TTS engine picks a voice that matches the *reply text's* language; mixing languages picks the wrong voice for the mixed section.",
-  );
+  if (hardRules.entries.length) {
+    lines.push("", hardRules.header, ...hardRules.entries);
+  }
 
   const intentHints = buildIntentHints(userText);
   if (intentHints.length) {
@@ -698,8 +504,11 @@ export async function resizeImageToFit(bytes, contentType, budget = MAX_PAYLOAD_
   return { bytes, contentType };
 }
 
-const KOKORO_BIN = "/Users/gado/bin/kokoro-tts";
-const PIPER_BIN  = "/Users/gado/bin/piper-tts";
+// Override with WRISTCLAW_KOKORO_BIN / WRISTCLAW_PIPER_BIN if your TTS binaries
+// aren't on PATH. Plain names like "kokoro-tts" resolve via $PATH, absolute
+// paths bypass the lookup.
+const KOKORO_BIN = process.env.WRISTCLAW_KOKORO_BIN || "kokoro-tts";
+const PIPER_BIN  = process.env.WRISTCLAW_PIPER_BIN  || "piper-tts";
 
 const PIPER_VOICES = new Set(["karlsson", "thorsten", "amy", "siwis", "harri", "paola"]);
 const KOKORO_VOICES = new Set([

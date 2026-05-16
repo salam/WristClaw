@@ -1,14 +1,29 @@
 {
   "name": "@wristclaw/openclaw-channel",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenClaw channel plugin for WristClaw Apple Watch relay",
   "type": "module",
   "license": "MIT",
   "homepage": "https://wristclaw.app",
   "repository": {
     "type": "git",
-    "url": "https://github.com/salam/wristclaw.git",
+    "url": "https://github.com/salam/WristClaw.git",
     "directory": "plugin"
+  },
+  "files": [
+    "index.js",
+    "setup-entry.js",
+    "protocol.js",
+    "wristclaw-runtime.js",
+    "wristclaw-intents.default.json",
+    "channel-plugin-api.js",
+    "catalog.json",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "openclaw": ">=2026.5.7"

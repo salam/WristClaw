@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Default WristClaw prompt fragments shipped with the plugin. Empty/minimal on purpose:",
+    "the routing table is most useful when it points at YOUR concrete skill files and binaries.",
+    "Override at runtime by setting WRISTCLAW_INTENTS_FILE, or by placing a JSON file at",
+    "~/.openclaw/wristclaw-intents.json. Schema:",
+    "  {",
+    "    skillRouting: { header, preamble, entries: [string] },",
+    "    hardRules:    { header, entries: [string] },",
+    "    intentHints:  [ { re, flags, exclusive, hint } ]",
+    "  }",
+    "Each intentHints entry: `re` is a JS regex source string (case-insensitive by default).",
+    "`exclusive` is an optional bucket name — within one prompt build, only the first matching",
+    "entry per bucket fires (use it for mutually-exclusive intents like 'image' vs 'satellite-image')."
+  ],
+  "skillRouting": {
+    "header": "[wristclaw skill routing — read FIRST]",
+    "preamble": "**Skills are markdown FILES, not tools.** To load a skill's instructions, call the `read` tool with the file's absolute path. Calling the skill name directly (e.g. `send-image(...)`) returns *Tool send-image not found* — never do that. If you have skills installed for this agent, list them here as `intent → file path` so future replies route correctly. Customize by writing your own ~/.openclaw/wristclaw-intents.json.",
+    "entries": []
+  },
+  "hardRules": {
+    "header": "[wristclaw hard rules]",
+    "entries": [
+      "- Never emit `MEDIA:image-<digits>` or any placeholder string in place of a real path. The adapter only ships real `/tmp/<file>.<ext>` paths or `https://...` URLs; placeholders are silently dropped and the watch user sees nothing.",
+      "- If a tool refuses or returns no usable data, say so honestly (\"I couldn't find a photo of X\", \"Calendar isn't connected\") rather than fabricating.",
+      "- Reply in the user's detected language. The TTS engine picks a voice that matches the *reply text's* language; mixing languages picks the wrong voice for the mixed section."
+    ]
+  },
+  "intentHints": []
+}

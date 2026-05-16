@@ -20,7 +20,7 @@ If the user just wants a stock photo of a thing (a car, a person, a building), u
 
 ### 1. Resolve the location
 
-- If "my location" / "here" / "where I am" → use the lat/lon from the `[ambient context]` section of this turn (`findmyloc` auto-injects user's current phone/watch position there every turn). Read the most recent fix for the user's primary device (`iPhone Matt` / `Apple Watch von Matthias`).
+- If "my location" / "here" / "where I am" → use the lat/lon from the `[ambient context]` section of this turn (your location-tracking skill should auto-inject the current device position there every turn). Read the most recent fix for the user's primary device.
 - If a place name → use the name directly; Google Maps will geocode.
 
 ### 2. Build the URL

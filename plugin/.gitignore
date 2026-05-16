@@ -1,1 +1,7 @@
 node_modules/
+
+# Per-user prompt-routing overrides live outside the repo at
+# ~/.openclaw/wristclaw-intents.json (or $WRISTCLAW_INTENTS_FILE).
+# Defensive: catch any accidentally-committed local copies.
+wristclaw-intents.json
+wristclaw-intents.local.json
